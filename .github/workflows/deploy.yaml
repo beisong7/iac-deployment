@@ -13,7 +13,7 @@ env:
   EC2_USER: ${{ secrets.EC2_USER }}
   EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
   DEPLOYMENT_DIR: /home/ubuntu/project-bedrock
-  ARCHIVE_NAME: project-bedrock.tar.gz
+  ARCHIVE_NAME: project-bedrock.zip
 
 permissions:
   contents: read
@@ -30,23 +30,33 @@ jobs:
 
       - name: Create deployment archive
         run: |
-          echo "Creating deployment archive..."
+          echo "Creating deployment archive with zip..."
           
-          # Create clean archive excluding unnecessary files
-          tar -czf ${{ env.ARCHIVE_NAME }} \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='node_modules' \
-            --exclude='*.log' \
-            --exclude='.DS_Store' \
-            --exclude='*.tmp' \
-            --exclude='target' \
-            --exclude='build' \
-            .
+          # Method 1: Using zip (most reliable for CI/CD)
+          zip -r ${{ env.ARCHIVE_NAME }} . \
+            -x '.git/*' \
+            -x '.github/*' \
+            -x 'node_modules/*' \
+            -x '*.log' \
+            -x '.DS_Store' \
+            -x '*.tmp' \
+            -x 'target/*' \
+            -x 'build/*' \
+            -x 'dist/*' \
+            -x '.next/*' \
+            -x 'coverage/*' \
+            -x '*.lock' \
+            -q
+          
+          # Verify archive was created successfully
+          if [ ! -f "${{ env.ARCHIVE_NAME }}" ]; then
+            echo "Error: Archive was not created"
+            exit 1
+          fi
           
           # Verify archive contents
           echo "Archive contents preview:"
-          tar -tzf ${{ env.ARCHIVE_NAME }} | head -20
+          unzip -l ${{ env.ARCHIVE_NAME }} | head -25
           
           # Get archive size for summary
           ARCHIVE_SIZE=$(du -h ${{ env.ARCHIVE_NAME }} | cut -f1)
@@ -116,7 +126,7 @@ jobs:
             
             # Extract the new archive
             echo "Extracting deployment archive..."
-            tar -xzf deployments/${{ needs.build.outputs.archive-name }} -C current/
+            unzip -q deployments/${{ needs.build.outputs.archive-name }} -d current/
             
             # Set proper permissions
             chmod -R 755 current/
