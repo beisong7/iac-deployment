@@ -13,7 +13,7 @@ env:
   EC2_USER: ${{ secrets.EC2_USER }}
   EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
   TERRAFORM_DIR: terraform/eks/default
-  ARCHIVE_NAME: project-bedrock-${{ github.sha }}.zip
+  ARCHIVE_NAME: project-bedrock.zip
 
 permissions:
   contents: read
