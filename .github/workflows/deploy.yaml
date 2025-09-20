@@ -311,7 +311,7 @@ jobs:
             export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
             
             # Deploy infrastructure with Terraform
-            cd terraform/project-bedrock
+            cd ${{ env.TERRAFORM_DIR }}
             terraform init
             terraform apply -auto-approve
             
