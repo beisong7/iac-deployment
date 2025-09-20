@@ -12,8 +12,8 @@ env:
   EC2_HOST: ${{ secrets.EC2_HOST }}
   EC2_USER: ${{ secrets.EC2_USER }}
   EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
-  DEPLOYMENT_DIR: /home/ubuntu/project-bedrock
-  ARCHIVE_NAME: project-bedrock.zip
+  TERRAFORM_DIR: terraform/eks/default
+  ARCHIVE_NAME: project-bedrock-${{ github.sha }}.zip
 
 permissions:
   contents: read
@@ -204,7 +204,7 @@ jobs:
             export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
             
             # Navigate to main terraform directory
-            cd terraform/project-bedrock
+            cd ${{ env.TERRAFORM_DIR }}
             
             # Initialize Terraform with remote backend
             terraform init
