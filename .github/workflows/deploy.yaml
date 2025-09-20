@@ -288,6 +288,7 @@ jobs:
   deploy:
     name: 🚀 Deploy Infrastructure & Application
     needs: [build, archive]
+    timeout-minutes: 45 
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/deploy' && github.event_name == 'push'
     environment: production
