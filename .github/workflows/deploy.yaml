@@ -1,0 +1,511 @@
+name: Deploy Project Bedrock Infrastructure
+
+on:
+  pull_request:
+    branches: [ "deploy" ]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [ "deploy" ]
+
+env:
+  AWS_REGION: us-east-1
+  EC2_HOST: ${{ secrets.EC2_HOST }}
+  EC2_USER: ${{ secrets.EC2_USER }}
+  EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+  DEPLOYMENT_DIR: /home/ec2-user/project-bedrock
+  ARCHIVE_NAME: project-bedrock-${{ github.sha }}.tar.gz
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # Build and prepare deployment package
+  build:
+    name: 🏗️ Build Deployment Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create deployment archive
+        run: |
+          echo "Creating deployment archive..."
+          
+          # Create clean archive excluding unnecessary files
+          tar -czf ${{ env.ARCHIVE_NAME }} \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='*.log' \
+            --exclude='.DS_Store' \
+            --exclude='*.tmp' \
+            --exclude='target' \
+            --exclude='build' \
+            .
+          
+          # Verify archive contents
+          echo "Archive contents preview:"
+          tar -tzf ${{ env.ARCHIVE_NAME }} | head -20
+          
+          # Get archive size for summary
+          ARCHIVE_SIZE=$(du -h ${{ env.ARCHIVE_NAME }} | cut -f1)
+          echo "Archive size: $ARCHIVE_SIZE"
+          echo "ARCHIVE_SIZE=$ARCHIVE_SIZE" >> $GITHUB_ENV
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-bedrock-archive
+          path: ${{ env.ARCHIVE_NAME }}
+          retention-days: 7
+
+    outputs:
+      archive-name: ${{ env.ARCHIVE_NAME }}
+      archive-size: ${{ env.ARCHIVE_SIZE }}
+
+  # Transfer deployment package to management instance
+  archive:
+    name: 📦 Transfer to Management Instance
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: project-bedrock-archive
+          path: .
+
+      - name: Transfer archive to EC2 management instance
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          source: ${{ needs.build.outputs.archive-name }}
+          target: "${{ env.DEPLOYMENT_DIR }}/deployments/"
+          overwrite: true
+          timeout: 300s
+          debug: true
+
+      - name: Prepare deployment on management instance
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Preparing deployment on management instance..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}
+            
+            # Create deployment directories if they don't exist
+            mkdir -p deployments current
+            
+            # Backup current deployment if it exists
+            if [ -d "current" ] && [ "$(ls -A current)" ]; then
+              echo "Backing up current deployment..."
+              mv current backup-$(date +%Y%m%d-%H%M%S)
+            fi
+            
+            # Create new deployment directory
+            mkdir -p current
+            
+            # Extract the new archive
+            echo "Extracting deployment archive..."
+            tar -xzf deployments/${{ needs.build.outputs.archive-name }} -C current/
+            
+            # Set proper permissions
+            chmod -R 755 current/
+            
+            # Verify extraction
+            echo "Deployment structure:"
+            ls -la current/
+            
+            echo "Archive extraction completed successfully"
+
+  # Validate infrastructure code (PR only)
+  validate:
+    name: ✅ Validate Infrastructure
+    needs: archive
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Validate Terraform configuration
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Validating Terraform configuration..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}/current
+            
+            # Find and validate all Terraform directories
+            TERRAFORM_DIRS=$(find . -name "*.tf" -type f | xargs dirname | sort -u)
+            
+            for dir in $TERRAFORM_DIRS; do
+              echo "Validating Terraform in: $dir"
+              cd ${{ env.DEPLOYMENT_DIR }}/current/$dir
+              
+              # Initialize without backend for validation
+              terraform init -backend=false
+              
+              # Format check
+              terraform fmt -check
+              
+              # Validate configuration
+              terraform validate
+              
+              echo "Validation passed for: $dir"
+            done
+            
+            echo "All Terraform validations completed successfully"
+
+  # Create Terraform plan (PR only)
+  plan:
+    name: 📋 Create Terraform Plan
+    needs: [build, archive, validate]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Execute Terraform plan
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Executing Terraform plan..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}/current
+            
+            # Configure AWS credentials
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
+            
+            # Navigate to main terraform directory
+            cd terraform/project-bedrock
+            
+            # Initialize Terraform with remote backend
+            terraform init
+            
+            # Create plan
+            terraform plan -out=tfplan -detailed-exitcode || PLAN_EXIT_CODE=$?
+            
+            # Generate plan output for PR comment
+            terraform show -no-color tfplan > plan_output.txt
+            
+            # Check if there are changes
+            if [ "${PLAN_EXIT_CODE:-0}" -eq 2 ]; then
+              echo "PLAN_HAS_CHANGES=true" > plan_status.txt
+            else
+              echo "PLAN_HAS_CHANGES=false" > plan_status.txt
+            fi
+            
+            echo "Terraform plan completed successfully"
+
+      - name: Comment PR with plan results
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            
+            try {
+              // Get plan output from management instance
+              const planOutput = execSync(`ssh -i ~/.ssh/id_rsa ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "cat ${{ env.DEPLOYMENT_DIR }}/current/terraform/project-bedrock/plan_output.txt"`, { encoding: 'utf8' });
+              
+              const planStatus = execSync(`ssh -i ~/.ssh/id_rsa ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "cat ${{ env.DEPLOYMENT_DIR }}/current/terraform/project-bedrock/plan_status.txt"`, { encoding: 'utf8' });
+              
+              const hasChanges = planStatus.includes('true');
+              const statusEmoji = hasChanges ? '📋' : '✅';
+              const statusText = hasChanges ? 'Changes Detected' : 'No Changes';
+              
+              const comment = `## ${statusEmoji} Terraform Plan Results - ${statusText}
+              
+              **Archive:** ${{ needs.build.outputs.archive-name }}
+              **Size:** ${{ needs.build.outputs.archive-size }}
+              **Branch:** ${{ github.head_ref }}
+              **Commit:** ${{ github.sha }}
+              
+              <details>
+              <summary>📋 View Terraform Plan Output</summary>
+              
+              \`\`\`hcl
+              ${planOutput.slice(0, 60000)}${planOutput.length > 60000 ? '\n... (output truncated for display)' : ''}
+              \`\`\`
+              
+              </details>
+              
+              ${hasChanges ? '⚠️ **This plan contains infrastructure changes that will be applied when merged to deploy branch.**' : '✅ **No infrastructure changes detected.**'}
+              `;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } catch (error) {
+              console.error('Error posting plan comment:', error);
+              
+              const errorComment = `## ❌ Terraform Plan Failed
+              
+              Failed to generate or retrieve Terraform plan. Please check the workflow logs for details.
+              
+              **Error:** ${error.message}
+              `;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: errorComment
+              });
+            }
+
+  # Deploy infrastructure and application (deploy branch only)
+  deploy:
+    name: 🚀 Deploy Infrastructure & Application
+    needs: [build, archive]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/deploy' && github.event_name == 'push'
+    environment: production
+    steps:
+      - name: Deploy infrastructure with Terraform
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Starting infrastructure deployment..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}/current
+            
+            # Configure AWS credentials
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
+            
+            # Deploy infrastructure with Terraform
+            cd terraform/project-bedrock
+            terraform init
+            terraform apply -auto-approve
+            
+            # Get outputs and save deployment info
+            terraform output -json > terraform_outputs.json
+            
+            # Update kubeconfig if EKS cluster exists
+            if terraform output cluster_name &>/dev/null; then
+              CLUSTER_NAME=$(terraform output -raw cluster_name)
+              aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name $CLUSTER_NAME
+              echo "CLUSTER_NAME=$CLUSTER_NAME" > ../deployment_info.txt
+              
+              # Get additional cluster info
+              VPC_ID=$(terraform output -raw vpc_id 2>/dev/null || echo "N/A")
+              echo "VPC_ID=$VPC_ID" >> ../deployment_info.txt
+            fi
+            
+            echo "Infrastructure deployment completed successfully"
+
+      - name: Deploy application to EKS cluster
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Starting application deployment..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}/current
+            
+            # Configure AWS and kubectl
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
+            
+            # Check if EKS cluster exists
+            if [ -f terraform/deployment_info.txt ]; then
+              source terraform/deployment_info.txt
+              
+              echo "Waiting for cluster nodes to be ready..."
+              kubectl wait --for=condition=Ready nodes --all --timeout=300s || echo "Some nodes may still be initializing"
+              
+              # Deploy application using Helm
+              cd src/app
+              
+              if [ -d "chart" ]; then
+                echo "Deploying retail store application with Helm..."
+                helm upgrade --install retail-store ./chart \
+                  --values values.yaml \
+                  --wait --timeout=600s \
+                  --create-namespace
+                
+                echo "Application deployed successfully"
+              else
+                echo "No Helm chart found, checking for Kubernetes manifests..."
+                
+                # Apply any kubernetes yaml files
+                find . -name "*.yaml" -o -name "*.yml" | grep -E "(k8s|kubernetes)" | while read manifest; do
+                  echo "Applying manifest: $manifest"
+                  kubectl apply -f "$manifest"
+                done
+              fi
+              
+              # Get application status
+              echo "Checking application status..."
+              kubectl get pods -A
+              kubectl get services
+              
+              # Try to get load balancer URL
+              LB_URL=$(kubectl get svc ui -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Service not found or no load balancer")
+              echo "APP_URL=$LB_URL" >> ../terraform/deployment_info.txt
+              
+              echo "Application deployment completed successfully"
+            else
+              echo "No EKS cluster found, skipping application deployment"
+            fi
+
+      - name: Run post-deployment verification
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Running post-deployment verification..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}/current
+            
+            # Configure kubectl
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
+            
+            if [ -f terraform/deployment_info.txt ]; then
+              # Check pod status
+              echo "Verifying pod status..."
+              FAILED_PODS=$(kubectl get pods -A --field-selector=status.phase!=Running --no-headers | wc -l)
+              
+              if [ "$FAILED_PODS" -eq 0 ]; then
+                echo "All pods are running successfully"
+              else
+                echo "Warning: $FAILED_PODS pods are not in Running state"
+                kubectl get pods -A --field-selector=status.phase!=Running
+              fi
+              
+              # Test service connectivity
+              echo "Testing service connectivity..."
+              kubectl get endpoints
+              
+              echo "Post-deployment verification completed"
+            else
+              echo "No cluster deployed, skipping verification"
+            fi
+
+      - name: Create deployment summary
+        run: |
+          # Configure SSH for getting deployment info
+          mkdir -p ~/.ssh
+          echo "${{ env.EC2_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ env.EC2_HOST }} >> ~/.ssh/known_hosts
+          
+          # Get deployment information from management instance
+          DEPLOYMENT_INFO=$(ssh -i ~/.ssh/id_rsa ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "cat ${{ env.DEPLOYMENT_DIR }}/current/terraform/deployment_info.txt 2>/dev/null || echo 'No deployment info available'")
+          
+          echo "## 🚀 Deployment Completed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ✅ Infrastructure and Application Deployed" >> $GITHUB_STEP_SUMMARY
+          echo "**Archive:** ${{ needs.build.outputs.archive-name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Size:** ${{ needs.build.outputs.archive-size }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Infrastructure Details" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "$DEPLOYMENT_INFO" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify application accessibility" >> $GITHUB_STEP_SUMMARY
+          echo "- Check monitoring and logging setup" >> $GITHUB_STEP_SUMMARY
+          echo "- Review security configurations" >> $GITHUB_STEP_SUMMARY
+
+  # Cleanup failed deployments
+  rollback:
+    name: 🔄 Rollback Failed Deployment
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    if: failure() && github.ref == 'refs/heads/deploy'
+    steps:
+      - name: Restore previous deployment
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Starting rollback process..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}
+            
+            # Find the most recent backup
+            LATEST_BACKUP=$(ls -1t backup-* 2>/dev/null | head -1 || echo "")
+            
+            if [ -n "$LATEST_BACKUP" ]; then
+              echo "Rolling back to: $LATEST_BACKUP"
+              
+              # Remove failed deployment
+              rm -rf current
+              
+              # Restore from backup
+              mv "$LATEST_BACKUP" current
+              
+              echo "Rollback completed successfully"
+              echo "Previous deployment has been restored"
+            else
+              echo "No backup found for rollback"
+              echo "Manual intervention may be required"
+            fi
+
+      - name: Cleanup deployment artifacts
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Cleaning up deployment artifacts..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}
+            
+            # Keep only last 5 backups
+            ls -t backup-* 2>/dev/null | tail -n +6 | xargs rm -rf || echo "No old backups to clean"
+            
+            # Keep only last 10 deployment archives
+            cd deployments
+            ls -t *.tar.gz 2>/dev/null | tail -n +11 | xargs rm -f || echo "No old archives to clean"
+            
+            echo "Cleanup completed"
