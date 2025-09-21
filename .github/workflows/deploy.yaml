@@ -315,7 +315,8 @@ jobs:
             # Deploy infrastructure with Terraform
             cd ${{ env.TERRAFORM_DIR }}
             terraform init
-            terraform apply -auto-approve
+            # terraform apply -auto-approve
+            terraform apply -var="environment_name=store-retailed" -auto-approve
             
             # Get outputs and save deployment info
             terraform output -json > terraform_outputs.json
