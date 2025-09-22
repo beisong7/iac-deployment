@@ -2,11 +2,8 @@ name: Deploy Project Bedrock Infrastructure
 
 
 on:
-  pull_request:
-    branches: [ "deploy" ]
-    types: [opened, synchronize, reopened]
   push:
-    branches: [ "deploy" ]
+    branches: [ "main" ]
 
 env:
   AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -139,53 +136,11 @@ jobs:
             
             echo "Archive extraction completed successfully"
 
-  # Validate infrastructure code (PR only)
-  validate:
-    name: ✅ Validate Infrastructure
-    needs: archive
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - name: Validate Terraform configuration
-        uses: appleboy/ssh-action@v0.1.10
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ${{ env.EC2_USER }}
-          key: ${{ env.EC2_PRIVATE_KEY }}
-          port: 22
-          debug: true
-          script: |
-            echo "Validating Terraform configuration..."
-            
-            cd ${{ env.DEPLOYMENT_DIR }}/current
-            
-            # Find and validate all Terraform directories
-            TERRAFORM_DIRS=$(find . -name "*.tf" -type f | xargs dirname | sort -u)
-            
-            for dir in $TERRAFORM_DIRS; do
-              echo "Validating Terraform in: $dir"
-              cd ${{ env.DEPLOYMENT_DIR }}/current/$dir
-              
-              # Initialize without backend for validation
-              terraform init -backend=false
-              
-              # Format check
-              terraform fmt -check
-              
-              # Validate configuration
-              terraform validate
-              
-              echo "Validation passed for: $dir"
-            done
-            
-            echo "All Terraform validations completed successfully"
-
   # Create Terraform plan (PR only)
   plan:
     name: 📋 Create Terraform Plan
-    needs: [build, archive, validate]
+    needs: [build, archive]
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
     steps:
       - name: Execute Terraform plan
         uses: appleboy/ssh-action@v0.1.10
