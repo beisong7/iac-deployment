@@ -1,4 +1,4 @@
-name: Deploy Project Bedrock Infrastructure
+name: CI Project Bedrock Infrastructure
 
 on:
   pull_request:
@@ -177,61 +177,4 @@ jobs:
             
             echo "Terraform plan completed successfully"
 
-      - name: Comment PR with plan results
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { execSync } = require('child_process');
-            
-            try {
-              // Get plan output from management instance
-              const planOutput = execSync(`ssh -i ~/.ssh/id_rsa ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "cat ${{ env.DEPLOYMENT_DIR }}/current/terraform/project-bedrock/plan_output.txt"`, { encoding: 'utf8' });
-              
-              const planStatus = execSync(`ssh -i ~/.ssh/id_rsa ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "cat ${{ env.DEPLOYMENT_DIR }}/current/terraform/project-bedrock/plan_status.txt"`, { encoding: 'utf8' });
-              
-              const hasChanges = planStatus.includes('true');
-              const statusEmoji = hasChanges ? '📋' : '✅';
-              const statusText = hasChanges ? 'Changes Detected' : 'No Changes';
-              
-              const comment = `## ${statusEmoji} Terraform Plan Results - ${statusText}
-              
-              **Archive:** ${{ needs.build.outputs.archive-name }}
-              **Size:** ${{ needs.build.outputs.archive-size }}
-              **Branch:** ${{ github.head_ref }}
-              **Commit:** ${{ github.sha }}
-              
-              <details>
-              <summary>📋 View Terraform Plan Output</summary>
-              
-              \`\`\`hcl
-              ${planOutput.slice(0, 60000)}${planOutput.length > 60000 ? '\n... (output truncated for display)' : ''}
-              \`\`\`
-              
-              </details>
-              
-              ${hasChanges ? '⚠️ **This plan contains infrastructure changes that will be applied when merged to deploy branch.**' : '✅ **No infrastructure changes detected.**'}
-              `;
-              
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: comment
-              });
-            } catch (error) {
-              console.error('Error posting plan comment:', error);
-              
-              const errorComment = `## ❌ Terraform Plan Failed
-              
-              Failed to generate or retrieve Terraform plan. Please check the workflow logs for details.
-              
-              **Error:** ${error.message}
-              `;
-              
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: errorComment
-              });
-            }
+    
