@@ -1,0 +1,180 @@
+name: CI Project Bedrock Infrastructure
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EC2_HOST: ${{ secrets.EC2_HOST }}
+  EC2_USER: ${{ secrets.EC2_USER }}
+  EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+  DEPLOYMENT_DIR: /home/ubuntu/project-bedrock
+  TERRAFORM_DIR: terraform/eks/default
+  ARCHIVE_NAME: project-bedrock.zip
+
+jobs:
+  # Build and prepare deployment package
+  build:
+    name: 🏗️ Build Deployment Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create deployment archive
+        run: |
+          echo "Creating deployment archive with zip..."
+          
+          # Method 1: Using zip (most reliable for CI/CD)
+          zip -r ${{ env.ARCHIVE_NAME }} . \
+            -x '.git/*' \
+            -x '.github/*' \
+            -x 'node_modules/*' \
+            -x '*.log' \
+            -x '.DS_Store' \
+            -x '*.tmp' \
+            -x 'target/*' \
+            -x 'build/*' \
+            -x 'dist/*' \
+            -x '.next/*' \
+            -x 'coverage/*' \
+            -x '*.lock' \
+            -q
+          
+          # Verify archive was created successfully
+          if [ ! -f "${{ env.ARCHIVE_NAME }}" ]; then
+            echo "Error: Archive was not created"
+            exit 1
+          fi
+          
+          # Verify archive contents
+          echo "Archive contents preview:"
+          unzip -l ${{ env.ARCHIVE_NAME }} | head -25
+          
+          # Get archive size for summary
+          ARCHIVE_SIZE=$(du -h ${{ env.ARCHIVE_NAME }} | cut -f1)
+          echo "Archive size: $ARCHIVE_SIZE"
+          echo "ARCHIVE_SIZE=$ARCHIVE_SIZE" >> $GITHUB_ENV
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-bedrock-archive
+          path: ${{ env.ARCHIVE_NAME }}
+          retention-days: 7
+
+    outputs:
+      archive-name: ${{ env.ARCHIVE_NAME }}
+      archive-size: ${{ env.ARCHIVE_SIZE }}
+
+  # Transfer deployment package to management instance
+  archive:
+    name: 📦 Transfer to Management Instance
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: project-bedrock-archive
+          path: .
+
+      - name: Transfer archive to EC2 management instance
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          source: ${{ needs.build.outputs.archive-name }}
+          target: "${{ env.DEPLOYMENT_DIR }}/deployments/"
+          overwrite: true
+          timeout: 300s
+          debug: true
+
+      - name: Prepare deployment on management instance
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Preparing deployment on management instance..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}
+            
+            # Create deployment directories if they don't exist
+            mkdir -p deployments current
+            
+            # Backup current deployment if it exists
+            if [ -d "current" ] && [ "$(ls -A current)" ]; then
+              echo "Backing up current deployment..."
+              mv current backup-$(date +%Y%m%d-%H%M%S)
+            fi
+            
+            # Create new deployment directory
+            mkdir -p current
+            
+            # Extract the new archive
+            echo "Extracting deployment archive..."
+            unzip -q deployments/${{ needs.build.outputs.archive-name }} -d current/
+            
+            # Set proper permissions
+            chmod -R 755 current/
+            
+            # Verify extraction
+            echo "Deployment structure:"
+            ls -la current/
+            
+            echo "Archive extraction completed successfully"
+
+  # Create Terraform plan (PR only)
+  plan:
+    name: 📋 Create Terraform Plan
+    needs: [build, archive]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Execute Terraform plan
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          debug: true
+          script: |
+            echo "Executing Terraform plan..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}/current
+            
+            # Configure AWS credentials
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
+            
+            # Navigate to main terraform directory
+            cd ${{ env.TERRAFORM_DIR }}
+            
+            # Initialize Terraform with remote backend
+            terraform init
+            
+            # Create plan
+            terraform plan -out=tfplan -detailed-exitcode || PLAN_EXIT_CODE=$?
+            
+            # Generate plan output for PR comment
+            terraform show -no-color tfplan > plan_output.txt
+            
+            # Check if there are changes
+            if [ "${PLAN_EXIT_CODE:-0}" -eq 2 ]; then
+              echo "PLAN_HAS_CHANGES=true" > plan_status.txt
+            else
+              echo "PLAN_HAS_CHANGES=false" > plan_status.txt
+            fi
+            
+            echo "Terraform plan completed successfully"
+
+    

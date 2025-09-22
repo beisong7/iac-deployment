@@ -1,282 +1,28 @@
 name: Deploy Project Bedrock Infrastructure
 
+
 on:
-  pull_request:
-    branches: [ "deploy" ]
-    types: [opened, synchronize, reopened]
   push:
-    branches: [ "deploy" ]
+    branches: [ "main" ]
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: ${{ secrets.AWS_REGION }}
   EC2_HOST: ${{ secrets.EC2_HOST }}
   EC2_USER: ${{ secrets.EC2_USER }}
   EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
-  DEPLOYMENT_DIR: /home/ec2-user/project-bedrock
-  ARCHIVE_NAME: project-bedrock-${{ github.sha }}.tar.gz
+  DEPLOYMENT_DIR: /home/ubuntu/project-bedrock
+  TERRAFORM_DIR: terraform/eks/default
+  ARCHIVE_NAME: project-bedrock.zip
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
-  # Build and prepare deployment package
-  build:
-    name: 🏗️ Build Deployment Package
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Create deployment archive
-        run: |
-          echo "Creating deployment archive..."
-          
-          # Create clean archive excluding unnecessary files
-          tar -czf ${{ env.ARCHIVE_NAME }} \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='node_modules' \
-            --exclude='*.log' \
-            --exclude='.DS_Store' \
-            --exclude='*.tmp' \
-            --exclude='target' \
-            --exclude='build' \
-            .
-          
-          # Verify archive contents
-          echo "Archive contents preview:"
-          tar -tzf ${{ env.ARCHIVE_NAME }} | head -20
-          
-          # Get archive size for summary
-          ARCHIVE_SIZE=$(du -h ${{ env.ARCHIVE_NAME }} | cut -f1)
-          echo "Archive size: $ARCHIVE_SIZE"
-          echo "ARCHIVE_SIZE=$ARCHIVE_SIZE" >> $GITHUB_ENV
-
-      - name: Upload deployment artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: project-bedrock-archive
-          path: ${{ env.ARCHIVE_NAME }}
-          retention-days: 7
-
-    outputs:
-      archive-name: ${{ env.ARCHIVE_NAME }}
-      archive-size: ${{ env.ARCHIVE_SIZE }}
-
-  # Transfer deployment package to management instance
-  archive:
-    name: 📦 Transfer to Management Instance
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download deployment artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: project-bedrock-archive
-          path: .
-
-      - name: Transfer archive to EC2 management instance
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ${{ env.EC2_USER }}
-          key: ${{ env.EC2_PRIVATE_KEY }}
-          port: 22
-          source: ${{ needs.build.outputs.archive-name }}
-          target: "${{ env.DEPLOYMENT_DIR }}/deployments/"
-          overwrite: true
-          timeout: 300s
-          debug: true
-
-      - name: Prepare deployment on management instance
-        uses: appleboy/ssh-action@v0.1.10
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ${{ env.EC2_USER }}
-          key: ${{ env.EC2_PRIVATE_KEY }}
-          port: 22
-          debug: true
-          script: |
-            echo "Preparing deployment on management instance..."
-            
-            cd ${{ env.DEPLOYMENT_DIR }}
-            
-            # Create deployment directories if they don't exist
-            mkdir -p deployments current
-            
-            # Backup current deployment if it exists
-            if [ -d "current" ] && [ "$(ls -A current)" ]; then
-              echo "Backing up current deployment..."
-              mv current backup-$(date +%Y%m%d-%H%M%S)
-            fi
-            
-            # Create new deployment directory
-            mkdir -p current
-            
-            # Extract the new archive
-            echo "Extracting deployment archive..."
-            tar -xzf deployments/${{ needs.build.outputs.archive-name }} -C current/
-            
-            # Set proper permissions
-            chmod -R 755 current/
-            
-            # Verify extraction
-            echo "Deployment structure:"
-            ls -la current/
-            
-            echo "Archive extraction completed successfully"
-
-  # Validate infrastructure code (PR only)
-  validate:
-    name: ✅ Validate Infrastructure
-    needs: archive
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - name: Validate Terraform configuration
-        uses: appleboy/ssh-action@v0.1.10
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ${{ env.EC2_USER }}
-          key: ${{ env.EC2_PRIVATE_KEY }}
-          port: 22
-          debug: true
-          script: |
-            echo "Validating Terraform configuration..."
-            
-            cd ${{ env.DEPLOYMENT_DIR }}/current
-            
-            # Find and validate all Terraform directories
-            TERRAFORM_DIRS=$(find . -name "*.tf" -type f | xargs dirname | sort -u)
-            
-            for dir in $TERRAFORM_DIRS; do
-              echo "Validating Terraform in: $dir"
-              cd ${{ env.DEPLOYMENT_DIR }}/current/$dir
-              
-              # Initialize without backend for validation
-              terraform init -backend=false
-              
-              # Format check
-              terraform fmt -check
-              
-              # Validate configuration
-              terraform validate
-              
-              echo "Validation passed for: $dir"
-            done
-            
-            echo "All Terraform validations completed successfully"
-
-  # Create Terraform plan (PR only)
-  plan:
-    name: 📋 Create Terraform Plan
-    needs: [build, archive, validate]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-    steps:
-      - name: Execute Terraform plan
-        uses: appleboy/ssh-action@v0.1.10
-        with:
-          host: ${{ env.EC2_HOST }}
-          username: ${{ env.EC2_USER }}
-          key: ${{ env.EC2_PRIVATE_KEY }}
-          port: 22
-          debug: true
-          script: |
-            echo "Executing Terraform plan..."
-            
-            cd ${{ env.DEPLOYMENT_DIR }}/current
-            
-            # Configure AWS credentials
-            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
-            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-            export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
-            
-            # Navigate to main terraform directory
-            cd terraform/project-bedrock
-            
-            # Initialize Terraform with remote backend
-            terraform init
-            
-            # Create plan
-            terraform plan -out=tfplan -detailed-exitcode || PLAN_EXIT_CODE=$?
-            
-            # Generate plan output for PR comment
-            terraform show -no-color tfplan > plan_output.txt
-            
-            # Check if there are changes
-            if [ "${PLAN_EXIT_CODE:-0}" -eq 2 ]; then
-              echo "PLAN_HAS_CHANGES=true" > plan_status.txt
-            else
-              echo "PLAN_HAS_CHANGES=false" > plan_status.txt
-            fi
-            
-            echo "Terraform plan completed successfully"
-
-      - name: Comment PR with plan results
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { execSync } = require('child_process');
-            
-            try {
-              // Get plan output from management instance
-              const planOutput = execSync(`ssh -i ~/.ssh/id_rsa ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "cat ${{ env.DEPLOYMENT_DIR }}/current/terraform/project-bedrock/plan_output.txt"`, { encoding: 'utf8' });
-              
-              const planStatus = execSync(`ssh -i ~/.ssh/id_rsa ${{ env.EC2_USER }}@${{ env.EC2_HOST }} "cat ${{ env.DEPLOYMENT_DIR }}/current/terraform/project-bedrock/plan_status.txt"`, { encoding: 'utf8' });
-              
-              const hasChanges = planStatus.includes('true');
-              const statusEmoji = hasChanges ? '📋' : '✅';
-              const statusText = hasChanges ? 'Changes Detected' : 'No Changes';
-              
-              const comment = `## ${statusEmoji} Terraform Plan Results - ${statusText}
-              
-              **Archive:** ${{ needs.build.outputs.archive-name }}
-              **Size:** ${{ needs.build.outputs.archive-size }}
-              **Branch:** ${{ github.head_ref }}
-              **Commit:** ${{ github.sha }}
-              
-              <details>
-              <summary>📋 View Terraform Plan Output</summary>
-              
-              \`\`\`hcl
-              ${planOutput.slice(0, 60000)}${planOutput.length > 60000 ? '\n... (output truncated for display)' : ''}
-              \`\`\`
-              
-              </details>
-              
-              ${hasChanges ? '⚠️ **This plan contains infrastructure changes that will be applied when merged to deploy branch.**' : '✅ **No infrastructure changes detected.**'}
-              `;
-              
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: comment
-              });
-            } catch (error) {
-              console.error('Error posting plan comment:', error);
-              
-              const errorComment = `## ❌ Terraform Plan Failed
-              
-              Failed to generate or retrieve Terraform plan. Please check the workflow logs for details.
-              
-              **Error:** ${error.message}
-              `;
-              
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: errorComment
-              });
-            }
-
   # Deploy infrastructure and application (deploy branch only)
   deploy:
     name: 🚀 Deploy Infrastructure & Application
-    needs: [build, archive]
+    timeout-minutes: 45 
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/deploy' && github.event_name == 'push'
     environment: production
@@ -300,9 +46,10 @@ jobs:
             export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
             
             # Deploy infrastructure with Terraform
-            cd terraform/project-bedrock
+            cd ${{ env.TERRAFORM_DIR }}
             terraform init
-            terraform apply -auto-approve
+            # terraform apply -auto-approve
+            terraform apply -var="environment_name=store-retailed" -auto-approve
             
             # Get outputs and save deployment info
             terraform output -json > terraform_outputs.json
@@ -508,4 +255,4 @@ jobs:
             cd deployments
             ls -t *.tar.gz 2>/dev/null | tail -n +11 | xargs rm -f || echo "No old archives to clean"
             
-            echo "Cleanup completed"
+            echo "Cleanup completed" 
