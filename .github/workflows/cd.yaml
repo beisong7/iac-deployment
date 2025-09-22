@@ -24,8 +24,6 @@ jobs:
     name: 🚀 Deploy Infrastructure & Application
     timeout-minutes: 45 
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/deploy' && github.event_name == 'push'
-    environment: production
     steps:
       - name: Deploy infrastructure with Terraform
         uses: appleboy/ssh-action@v0.1.10
