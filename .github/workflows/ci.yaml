@@ -162,17 +162,32 @@ jobs:
             # Initialize Terraform with remote backend
             terraform init
             
-            # Create plan
-            terraform plan -out=tfplan -detailed-exitcode || PLAN_EXIT_CODE=$?
+            # Create plan and capture exit code
+            set +e  # Don't exit on error
+            terraform plan -out=tfplan -detailed-exitcode
+            PLAN_EXIT_CODE=$?
+            set -e  # Resume exit on error
             
-            # Generate plan output for PR comment
-            terraform show -no-color tfplan > plan_output.txt
+            # Generate plan output for PR comment if plan file exists
+            if [ -f "tfplan" ]; then
+              terraform show -no-color tfplan > plan_output.txt
+            else
+              echo "Terraform plan failed" > plan_output.txt
+              cat plan_output.txt
+              exit 1
+            fi
             
             # Check if there are changes
-            if [ "${PLAN_EXIT_CODE:-0}" -eq 2 ]; then
+            if [ "${PLAN_EXIT_CODE}" -eq 2 ]; then
               echo "PLAN_HAS_CHANGES=true" > plan_status.txt
-            else
+              echo "Terraform plan shows changes will be made"
+            elif [ "${PLAN_EXIT_CODE}" -eq 0 ]; then
               echo "PLAN_HAS_CHANGES=false" > plan_status.txt
+              echo "Terraform plan shows no changes needed"
+            else
+              echo "PLAN_HAS_CHANGES=error" > plan_status.txt
+              echo "Terraform plan failed with exit code: ${PLAN_EXIT_CODE}"
+              exit 1
             fi
             
             echo "Terraform plan completed successfully"
