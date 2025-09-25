@@ -1,0 +1,524 @@
+# Namespace for the retail store application
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: retail-store
+  labels:
+    name: retail-store
+---
+# MySQL Database for Catalog Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-mysql
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: catalog-mysql
+  template:
+    metadata:
+      labels:
+        app: catalog-mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        ports:
+        - containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "my-secret-pw"
+        - name: MYSQL_DATABASE
+          value: "catalog"
+        - name: MYSQL_USER
+          value: "catalog_user"
+        - name: MYSQL_PASSWORD
+          value: "default_password"
+        volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+      volumes:
+      - name: mysql-storage
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-mysql
+  namespace: retail-store
+spec:
+  selector:
+    app: catalog-mysql
+  ports:
+  - port: 3306
+    targetPort: 3306
+---
+# DynamoDB Local for Carts Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carts-dynamodb
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: carts-dynamodb
+  template:
+    metadata:
+      labels:
+        app: carts-dynamodb
+    spec:
+      containers:
+      - name: dynamodb-local
+        image: amazon/dynamodb-local:latest
+        ports:
+        - containerPort: 8000
+        command:
+        - java
+        - -jar
+        - DynamoDBLocal.jar
+        - -sharedDb
+        - -inMemory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: carts-dynamodb
+  namespace: retail-store
+spec:
+  selector:
+    app: carts-dynamodb
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+# PostgreSQL for Orders Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-postgres
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orders-postgres
+  template:
+    metadata:
+      labels:
+        app: orders-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:13
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_DB
+          value: "orders"
+        - name: POSTGRES_USER
+          value: "orders_user"
+        - name: POSTGRES_PASSWORD
+          value: "default_password"
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: postgres-storage
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-postgres
+  namespace: retail-store
+spec:
+  selector:
+    app: orders-postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+---
+# RabbitMQ for Orders Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-rabbitmq
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orders-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: orders-rabbitmq
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3.12-management
+        ports:
+        - containerPort: 5672
+        - containerPort: 15672
+        env:
+        - name: RABBITMQ_DEFAULT_USER
+          value: "guest"
+        - name: RABBITMQ_DEFAULT_PASS
+          value: "guest"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-rabbitmq
+  namespace: retail-store
+spec:
+  selector:
+    app: orders-rabbitmq
+  ports:
+  - name: amqp
+    port: 5672
+    targetPort: 5672
+  - name: management
+    port: 15672
+    targetPort: 15672
+---
+# Redis for Checkout Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-redis
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: checkout-redis
+  template:
+    metadata:
+      labels:
+        app: checkout-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7
+        ports:
+        - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout-redis
+  namespace: retail-store
+spec:
+  selector:
+    app: checkout-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+---
+# Catalog Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: catalog
+  template:
+    metadata:
+      labels:
+        app: catalog
+    spec:
+      containers:
+      - name: catalog
+        image: public.ecr.aws/aws-containers/retail-store-sample-catalog:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: DB_HOST
+          value: "catalog-mysql"
+        - name: DB_PORT
+          value: "3306"
+        - name: DB_NAME
+          value: "catalog"
+        - name: DB_USER
+          value: "catalog_user"
+        - name: DB_PASSWORD
+          value: "default_password"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 15
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.28
+        command: ['sh', '-c', 'until nc -z catalog-mysql 3306; do echo waiting for db; sleep 2; done;']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog
+  namespace: retail-store
+spec:
+  selector:
+    app: catalog
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# Carts Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carts
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: carts
+  template:
+    metadata:
+      labels:
+        app: carts
+    spec:
+      containers:
+      - name: carts
+        image: public.ecr.aws/aws-containers/retail-store-sample-cart:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "dynamodb"
+        - name: CARTS_DYNAMODB_ENDPOINT
+          value: "http://carts-dynamodb:8000"
+        - name: CARTS_DYNAMODB_CREATETABLE
+          value: "true"
+        - name: AWS_ACCESS_KEY_ID
+          value: "key"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "dummy"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 15
+      initContainers:
+      - name: wait-for-dynamodb
+        image: busybox:1.28
+        command: ['sh', '-c', 'until nc -z carts-dynamodb 8000; do echo waiting for dynamodb; sleep 2; done;']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: carts
+  namespace: retail-store
+spec:
+  selector:
+    app: carts
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# Orders Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orders
+  template:
+    metadata:
+      labels:
+        app: orders
+    spec:
+      containers:
+      - name: orders
+        image: public.ecr.aws/aws-containers/retail-store-sample-orders:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "postgres,rabbitmq"
+        - name: SPRING_DATASOURCE_URL
+          value: "jdbc:postgresql://orders-postgres:5432/orders?useSSL=false&allowPublicKeyRetrieval=true"
+        - name: SPRING_DATASOURCE_USERNAME
+          value: "orders_user"
+        - name: SPRING_DATASOURCE_PASSWORD
+          value: "default_password"
+        - name: SPRING_RABBITMQ_HOST
+          value: "orders-rabbitmq"
+        - name: SPRING_RABBITMQ_USERNAME
+          value: "guest"
+        - name: SPRING_RABBITMQ_PASSWORD
+          value: "guest"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 15
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.28
+        command: ['sh', '-c', 'until nc -z orders-postgres 5432; do echo waiting for db; sleep 2; done;']
+      - name: wait-for-rabbitmq
+        image: busybox:1.28
+        command: ['sh', '-c', 'until nc -z orders-rabbitmq 5672; do echo waiting for rabbitmq; sleep 2; done;']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders
+  namespace: retail-store
+spec:
+  selector:
+    app: orders
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# Checkout Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: checkout
+  template:
+    metadata:
+      labels:
+        app: checkout
+    spec:
+      containers:
+      - name: checkout
+        image: public.ecr.aws/aws-containers/retail-store-sample-checkout:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: REDIS_HOST
+          value: "checkout-redis"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: ENDPOINTS_ORDERS
+          value: "http://orders"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 15
+      initContainers:
+      - name: wait-for-redis
+        image: busybox:1.28
+        command: ['sh', '-c', 'until nc -z checkout-redis 6379; do echo waiting for redis; sleep 2; done;']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: checkout
+  namespace: retail-store
+spec:
+  selector:
+    app: checkout
+  ports:
+  - port: 80
+    targetPort: 8080
+---
+# UI Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ui
+  namespace: retail-store
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ui
+  template:
+    metadata:
+      labels:
+        app: ui
+    spec:
+      containers:
+      - name: ui
+        image: public.ecr.aws/aws-containers/retail-store-sample-ui:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: ENDPOINTS_CATALOG
+          value: "http://catalog"
+        - name: ENDPOINTS_CARTS
+          value: "http://carts"
+        - name: ENDPOINTS_CHECKOUT
+          value: "http://checkout"
+        - name: ENDPOINTS_ORDERS
+          value: "http://orders"
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ui
+  namespace: retail-store
+spec:
+  selector:
+    app: ui
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: LoadBalancer
