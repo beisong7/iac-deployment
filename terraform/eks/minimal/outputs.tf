@@ -69,6 +69,7 @@ output "developer_kubeconfig_command" {
 
 output "developer_setup_instructions" {
   description = "Setup instructions for developer access"
+  sensitive   = true
   value = <<-EOT
 # Developer Setup Instructions for EKS Cluster Access
 
