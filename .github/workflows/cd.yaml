@@ -22,7 +22,7 @@ jobs:
   # Deploy infrastructure and application (deploy branch only)
   deploy:
     name: 🚀 Deploy Infrastructure & Application
-    timeout-minutes: 45 
+    timeout-minutes: 120 
     runs-on: ubuntu-latest
     steps:
       - name: Deploy infrastructure with Terraform
@@ -33,6 +33,7 @@ jobs:
           key: ${{ env.EC2_PRIVATE_KEY }}
           port: 22
           debug: true
+          command_timeout: 30m
           script: |
             echo "Starting infrastructure deployment..."
             
@@ -73,6 +74,7 @@ jobs:
           key: ${{ env.EC2_PRIVATE_KEY }}
           port: 22
           debug: true
+          command_timeout: 30m
           script: |
             echo "Starting application deployment..."
             
@@ -145,6 +147,7 @@ jobs:
           key: ${{ env.EC2_PRIVATE_KEY }}
           port: 22
           debug: true
+          command_timeout: 30m
           script: |
             echo "Running post-deployment verification..."
             
