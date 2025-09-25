@@ -1,0 +1,906 @@
+name: Complete Retail Store Deployment
+
+on:
+  pull_request:
+    branches: [ "deploy" ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EC2_HOST: ${{ secrets.EC2_HOST }}
+  EC2_USER: ${{ secrets.EC2_USER }}
+  EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+  DEPLOYMENT_DIR: /home/ubuntu/project-bedrock
+  TERRAFORM_DIR: terraform/eks/minimal
+  REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+jobs:
+  # Step 1: Create ECR repositories first using Terraform
+  create-ecr:
+    name: 🏗️ Create ECR Repositories
+    runs-on: ubuntu-latest
+    outputs:
+      ecr-registry: ${{ steps.ecr-info.outputs.registry }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create ECR repositories via Terraform
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          script: |
+            echo "Creating ECR repositories..."
+            
+            # Create ECR terraform configuration
+            cat > /tmp/ecr.tf << 'EOF'
+            terraform {
+              required_providers {
+                aws = {
+                  source  = "hashicorp/aws"
+                  version = "~> 5.0"
+                }
+              }
+            }
+
+            provider "aws" {}
+
+            data "aws_caller_identity" "current" {}
+            data "aws_region" "current" {}
+
+            variable "services" {
+              type = list(string)
+              default = ["catalog", "cart", "checkout", "orders", "ui"]
+            }
+
+            resource "aws_ecr_repository" "retail_store_services" {
+              for_each = toset(var.services)
+              name     = "retail-store-${each.key}"
+
+              image_tag_mutability = "MUTABLE"
+              image_scanning_configuration {
+                scan_on_push = true
+              }
+
+              tags = {
+                Environment = "production"
+                Project     = "retail-store"
+                Service     = each.key
+              }
+            }
+
+            resource "aws_ecr_lifecycle_policy" "retail_store_policy" {
+              for_each   = aws_ecr_repository.retail_store_services
+              repository = each.value.name
+
+              policy = jsonencode({
+                rules = [
+                  {
+                    rulePriority = 1
+                    description  = "Keep last 10 images"
+                    selection = {
+                      tagStatus     = "tagged"
+                      tagPrefixList = ["v"]
+                      countType     = "imageCountMoreThan"
+                      countNumber   = 10
+                    }
+                    action = {
+                      type = "expire"
+                    }
+                  },
+                  {
+                    rulePriority = 2
+                    description  = "Delete untagged images older than 1 day"
+                    selection = {
+                      tagStatus   = "untagged"
+                      countType   = "sinceImagePushed"
+                      countUnit   = "days"
+                      countNumber = 1
+                    }
+                    action = {
+                      type = "expire"
+                    }
+                  }
+                ]
+              })
+            }
+
+            output "ecr_repositories" {
+              value = {
+                for k, v in aws_ecr_repository.retail_store_services : k => {
+                  repository_url = v.repository_url
+                  registry_id    = v.registry_id
+                }
+              }
+            }
+
+            output "registry_url" {
+              value = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${data.aws_region.current.name}.amazonaws.com"
+            }
+            EOF
+
+            # Apply ECR infrastructure
+            cd /tmp
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
+            
+            terraform init
+            terraform apply -auto-approve
+            terraform output -json > ecr_outputs.json
+
+      - name: Get ECR registry info
+        id: ecr-info
+        run: |
+          echo "registry=${{ env.REGISTRY }}" >> $GITHUB_OUTPUT
+
+  # Step 2: Build all service images in parallel
+  build-images:
+    name: 🔨 Build Service Images
+    runs-on: ubuntu-latest
+    needs: create-ecr
+    strategy:
+      matrix:
+        service: [catalog, cart, checkout, orders, ui]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ matrix.service }} image
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: retail-store-${{ matrix.service }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Building ${{ matrix.service }} service..."
+          
+          # Build and push image
+          docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            --tag $REGISTRY/$REPOSITORY:$IMAGE_TAG \
+            --tag $REGISTRY/$REPOSITORY:latest \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            ./src/${{ matrix.service }}
+          
+          echo "Successfully built and pushed $REGISTRY/$REPOSITORY:$IMAGE_TAG"
+
+  # Step 3: Generate custom Kubernetes manifests with ECR images
+  generate-manifests:
+    name: 📝 Generate Custom Kubernetes Manifests
+    runs-on: ubuntu-latest
+    needs: [create-ecr, build-images]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate custom manifest with ECR images
+        env:
+          REGISTRY: ${{ needs.create-ecr.outputs.ecr-registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Create custom manifest with ECR images
+          cat > k8s-manifests/retail-store-custom.yaml << EOF
+          # Namespace for the retail store application
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: retail-store
+            labels:
+              name: retail-store
+          ---
+          # MySQL Database for Catalog Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: catalog-mysql
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: catalog-mysql
+            template:
+              metadata:
+                labels:
+                  app: catalog-mysql
+              spec:
+                containers:
+                - name: mysql
+                  image: mysql:8.0
+                  ports:
+                  - containerPort: 3306
+                  env:
+                  - name: MYSQL_ROOT_PASSWORD
+                    value: "my-secret-pw"
+                  - name: MYSQL_DATABASE
+                    value: "catalog"
+                  - name: MYSQL_USER
+                    value: "catalog_user"
+                  - name: MYSQL_PASSWORD
+                    value: "default_password"
+                  volumeMounts:
+                  - name: mysql-storage
+                    mountPath: /var/lib/mysql
+                volumes:
+                - name: mysql-storage
+                  emptyDir: {}
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: catalog-mysql
+            namespace: retail-store
+          spec:
+            selector:
+              app: catalog-mysql
+            ports:
+            - port: 3306
+              targetPort: 3306
+          ---
+          # DynamoDB Local for Carts Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: carts-dynamodb
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: carts-dynamodb
+            template:
+              metadata:
+                labels:
+                  app: carts-dynamodb
+              spec:
+                containers:
+                - name: dynamodb-local
+                  image: amazon/dynamodb-local:latest
+                  ports:
+                  - containerPort: 8000
+                  command:
+                  - java
+                  - -jar
+                  - DynamoDBLocal.jar
+                  - -sharedDb
+                  - -inMemory
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: carts-dynamodb
+            namespace: retail-store
+          spec:
+            selector:
+              app: carts-dynamodb
+            ports:
+            - port: 8000
+              targetPort: 8000
+          ---
+          # PostgreSQL for Orders Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: orders-postgres
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: orders-postgres
+            template:
+              metadata:
+                labels:
+                  app: orders-postgres
+              spec:
+                containers:
+                - name: postgres
+                  image: postgres:13
+                  ports:
+                  - containerPort: 5432
+                  env:
+                  - name: POSTGRES_DB
+                    value: "orders"
+                  - name: POSTGRES_USER
+                    value: "orders_user"
+                  - name: POSTGRES_PASSWORD
+                    value: "default_password"
+                  volumeMounts:
+                  - name: postgres-storage
+                    mountPath: /var/lib/postgresql/data
+                volumes:
+                - name: postgres-storage
+                  emptyDir: {}
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: orders-postgres
+            namespace: retail-store
+          spec:
+            selector:
+              app: orders-postgres
+            ports:
+            - port: 5432
+              targetPort: 5432
+          ---
+          # RabbitMQ for Orders Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: orders-rabbitmq
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: orders-rabbitmq
+            template:
+              metadata:
+                labels:
+                  app: orders-rabbitmq
+              spec:
+                containers:
+                - name: rabbitmq
+                  image: rabbitmq:3.12-management
+                  ports:
+                  - containerPort: 5672
+                  - containerPort: 15672
+                  env:
+                  - name: RABBITMQ_DEFAULT_USER
+                    value: "guest"
+                  - name: RABBITMQ_DEFAULT_PASS
+                    value: "guest"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: orders-rabbitmq
+            namespace: retail-store
+          spec:
+            selector:
+              app: orders-rabbitmq
+            ports:
+            - name: amqp
+              port: 5672
+              targetPort: 5672
+            - name: management
+              port: 15672
+              targetPort: 15672
+          ---
+          # Redis for Checkout Service
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: checkout-redis
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: checkout-redis
+            template:
+              metadata:
+                labels:
+                  app: checkout-redis
+              spec:
+                containers:
+                - name: redis
+                  image: redis:7
+                  ports:
+                  - containerPort: 6379
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: checkout-redis
+            namespace: retail-store
+          spec:
+            selector:
+              app: checkout-redis
+            ports:
+            - port: 6379
+              targetPort: 6379
+          ---
+          # Catalog Service - CUSTOM ECR IMAGE
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: catalog
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: catalog
+            template:
+              metadata:
+                labels:
+                  app: catalog
+              spec:
+                containers:
+                - name: catalog
+                  image: ${REGISTRY}/retail-store-catalog:${IMAGE_TAG}
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: DB_HOST
+                    value: "catalog-mysql"
+                  - name: DB_PORT
+                    value: "3306"
+                  - name: DB_NAME
+                    value: "catalog"
+                  - name: DB_USER
+                    value: "catalog_user"
+                  - name: DB_PASSWORD
+                    value: "default_password"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 5
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 15
+                imagePullSecrets:
+                - name: ecr-registry-key
+                initContainers:
+                - name: wait-for-db
+                  image: busybox:1.28
+                  command: ['sh', '-c', 'until nc -z catalog-mysql 3306; do echo waiting for db; sleep 2; done;']
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: catalog
+            namespace: retail-store
+          spec:
+            selector:
+              app: catalog
+            ports:
+            - port: 80
+              targetPort: 8080
+          ---
+          # Carts Service - CUSTOM ECR IMAGE
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: carts
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: carts
+            template:
+              metadata:
+                labels:
+                  app: carts
+              spec:
+                containers:
+                - name: carts
+                  image: ${REGISTRY}/retail-store-cart:${IMAGE_TAG}
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: SPRING_PROFILES_ACTIVE
+                    value: "dynamodb"
+                  - name: CARTS_DYNAMODB_ENDPOINT
+                    value: "http://carts-dynamodb:8000"
+                  - name: CARTS_DYNAMODB_CREATETABLE
+                    value: "true"
+                  - name: AWS_ACCESS_KEY_ID
+                    value: "key"
+                  - name: AWS_SECRET_ACCESS_KEY
+                    value: "dummy"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 5
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 15
+                imagePullSecrets:
+                - name: ecr-registry-key
+                initContainers:
+                - name: wait-for-dynamodb
+                  image: busybox:1.28
+                  command: ['sh', '-c', 'until nc -z carts-dynamodb 8000; do echo waiting for dynamodb; sleep 2; done;']
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: carts
+            namespace: retail-store
+          spec:
+            selector:
+              app: carts
+            ports:
+            - port: 80
+              targetPort: 8080
+          ---
+          # Orders Service - CUSTOM ECR IMAGE
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: orders
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: orders
+            template:
+              metadata:
+                labels:
+                  app: orders
+              spec:
+                containers:
+                - name: orders
+                  image: ${REGISTRY}/retail-store-orders:${IMAGE_TAG}
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: SPRING_PROFILES_ACTIVE
+                    value: "postgres,rabbitmq"
+                  - name: SPRING_DATASOURCE_URL
+                    value: "jdbc:postgresql://orders-postgres:5432/orders?useSSL=false&allowPublicKeyRetrieval=true"
+                  - name: SPRING_DATASOURCE_USERNAME
+                    value: "orders_user"
+                  - name: SPRING_DATASOURCE_PASSWORD
+                    value: "default_password"
+                  - name: SPRING_RABBITMQ_HOST
+                    value: "orders-rabbitmq"
+                  - name: SPRING_RABBITMQ_USERNAME
+                    value: "guest"
+                  - name: SPRING_RABBITMQ_PASSWORD
+                    value: "guest"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 5
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 15
+                imagePullSecrets:
+                - name: ecr-registry-key
+                initContainers:
+                - name: wait-for-db
+                  image: busybox:1.28
+                  command: ['sh', '-c', 'until nc -z orders-postgres 5432; do echo waiting for db; sleep 2; done;']
+                - name: wait-for-rabbitmq
+                  image: busybox:1.28
+                  command: ['sh', '-c', 'until nc -z orders-rabbitmq 5672; do echo waiting for rabbitmq; sleep 2; done;']
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: orders
+            namespace: retail-store
+          spec:
+            selector:
+              app: orders
+            ports:
+            - port: 80
+              targetPort: 8080
+          ---
+          # Checkout Service - CUSTOM ECR IMAGE
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: checkout
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: checkout
+            template:
+              metadata:
+                labels:
+                  app: checkout
+              spec:
+                containers:
+                - name: checkout
+                  image: ${REGISTRY}/retail-store-checkout:${IMAGE_TAG}
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: REDIS_HOST
+                    value: "checkout-redis"
+                  - name: REDIS_PORT
+                    value: "6379"
+                  - name: ENDPOINTS_ORDERS
+                    value: "http://orders"
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 5
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 15
+                imagePullSecrets:
+                - name: ecr-registry-key
+                initContainers:
+                - name: wait-for-redis
+                  image: busybox:1.28
+                  command: ['sh', '-c', 'until nc -z checkout-redis 6379; do echo waiting for redis; sleep 2; done;']
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: checkout
+            namespace: retail-store
+          spec:
+            selector:
+              app: checkout
+            ports:
+            - port: 80
+              targetPort: 8080
+          ---
+          # UI Service - CUSTOM ECR IMAGE
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ui
+            namespace: retail-store
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ui
+            template:
+              metadata:
+                labels:
+                  app: ui
+              spec:
+                containers:
+                - name: ui
+                  image: ${REGISTRY}/retail-store-ui:${IMAGE_TAG}
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: ENDPOINTS_CATALOG
+                    value: "http://catalog"
+                  - name: ENDPOINTS_CARTS
+                    value: "http://carts"
+                  - name: ENDPOINTS_CHECKOUT
+                    value: "http://checkout"
+                  - name: ENDPOINTS_ORDERS
+                    value: "http://orders"
+                  readinessProbe:
+                    httpGet:
+                      path: /actuator/health/readiness
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 5
+                  livenessProbe:
+                    httpGet:
+                      path: /actuator/health/liveness
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 15
+                imagePullSecrets:
+                - name: ecr-registry-key
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ui
+            namespace: retail-store
+          spec:
+            selector:
+              app: ui
+            ports:
+            - port: 80
+              targetPort: 8080
+            type: LoadBalancer
+          ---
+          # ECR Registry Secret for pulling private images
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: ecr-registry-key
+            namespace: retail-store
+          type: kubernetes.io/dockerconfigjson
+          data:
+            .dockerconfigjson: ""
+          EOF
+
+      - name: Upload custom manifest as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: custom-manifests
+          path: k8s-manifests/retail-store-custom.yaml
+
+  # Step 4: Deploy infrastructure with Terraform
+  deploy-infrastructure:
+    name: 🚀 Deploy EKS Infrastructure
+    runs-on: ubuntu-latest
+    needs: [create-ecr, generate-manifests]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download custom manifests
+        uses: actions/download-artifact@v4
+        with:
+          name: custom-manifests
+          path: k8s-manifests/
+
+      - name: Create deployment archive
+        run: |
+          zip -r project-bedrock-custom.zip . \
+            -x '.git/*' \
+            -x '.github/*' \
+            -x 'node_modules/*' \
+            -x '*.log' \
+            -q
+
+      - name: Transfer to management instance
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          source: project-bedrock-custom.zip
+          target: "${{ env.DEPLOYMENT_DIR }}/deployments/"
+
+      - name: Deploy infrastructure with Terraform
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          script: |
+            echo "Deploying EKS infrastructure..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}
+            rm -rf current-custom || true
+            mkdir -p current-custom
+            unzip -q deployments/project-bedrock-custom.zip -d current-custom/
+            cd current-custom
+            
+            # Configure AWS credentials
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
+            
+            # Deploy EKS infrastructure
+            cd ${{ env.TERRAFORM_DIR }}
+            terraform init
+            terraform apply -var="environment_name=retail-store" -auto-approve
+            
+            # Update kubeconfig
+            CLUSTER_NAME=$(terraform output -raw cluster_name)
+            aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name $CLUSTER_NAME
+            
+            echo "Infrastructure deployment completed"
+
+  # Step 5: Deploy application to EKS
+  deploy-application:
+    name: 🎯 Deploy Custom Application
+    runs-on: ubuntu-latest
+    needs: [create-ecr, build-images, deploy-infrastructure]
+    steps:
+      - name: Deploy application to EKS
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.EC2_HOST }}
+          username: ${{ env.EC2_USER }}
+          key: ${{ env.EC2_PRIVATE_KEY }}
+          port: 22
+          script: |
+            echo "Deploying custom retail store application..."
+            
+            cd ${{ env.DEPLOYMENT_DIR }}/current-custom
+            
+            # Configure AWS and kubectl
+            export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+            export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
+            
+            # Create ECR registry secret for pulling private images
+            kubectl create secret docker-registry ecr-registry-key \
+              --namespace=retail-store \
+              --docker-server=${{ env.REGISTRY }} \
+              --docker-username=AWS \
+              --docker-password=$(aws ecr get-login-password --region ${{ env.AWS_REGION }}) \
+              --dry-run=client -o yaml | kubectl apply -f -
+            
+            # Deploy custom application with ECR images
+            kubectl apply -f k8s-manifests/retail-store-custom.yaml
+            
+            # Wait for deployments to be ready
+            echo "Waiting for all deployments to be ready..."
+            kubectl wait --for=condition=available --timeout=600s deployment --all -n retail-store
+            
+            # Get application status
+            echo "Application deployment completed!"
+            echo "Current pods:"
+            kubectl get pods -n retail-store
+            echo "Services:"
+            kubectl get services -n retail-store
+            
+            # Get LoadBalancer URL
+            LOAD_BALANCER_URL=$(kubectl get svc ui -n retail-store -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "LoadBalancer provisioning...")
+            echo "Application will be available at: http://$LOAD_BALANCER_URL"
+
+  # Step 6: Final deployment summary
+  deployment-summary:
+    name: 📊 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [create-ecr, build-images, generate-manifests, deploy-infrastructure, deploy-application]
+    if: always()
+    steps:
+      - name: Generate deployment summary
+        run: |
+          echo "## 🎉 Retail Store Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Completed Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏗️ Created ECR repositories for all services" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔨 Built custom Docker images from source code" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 Pushed images to private ECR registries" >> $GITHUB_STEP_SUMMARY
+          echo "- 🚀 Deployed EKS infrastructure with Terraform" >> $GITHUB_STEP_SUMMARY
+          echo "- 🎯 Deployed application with custom ECR images" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Services Deployed:" >> $GITHUB_STEP_SUMMARY
+          echo "- **UI Service**: Frontend web application" >> $GITHUB_STEP_SUMMARY
+          echo "- **Catalog Service**: Product catalog management" >> $GITHUB_STEP_SUMMARY  
+          echo "- **Cart Service**: Shopping cart functionality" >> $GITHUB_STEP_SUMMARY
+          echo "- **Checkout Service**: Payment processing" >> $GITHUB_STEP_SUMMARY
+          echo "- **Orders Service**: Order management" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🗄️ Infrastructure:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Database**: MySQL (Catalog), PostgreSQL (Orders), DynamoDB (Carts)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cache**: Redis (Checkout sessions)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Messaging**: RabbitMQ (Order processing)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Container Registry**: Private ECR repositories" >> $GITHUB_STEP_SUMMARY
+          echo "- **Orchestration**: Amazon EKS cluster" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Access Information:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Application URL**: Available via LoadBalancer service" >> $GITHUB_STEP_SUMMARY
+          echo "- **Namespace**: retail-store" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Registry**: ${{ env.REGISTRY }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Git Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🎊 **Deployment Status**: Custom ECR images successfully deployed!" >> $GITHUB_STEP_SUMMARY

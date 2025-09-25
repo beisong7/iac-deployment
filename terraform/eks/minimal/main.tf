@@ -28,8 +28,6 @@ module "retail_app_eks" {
   providers = {
     kubernetes.cluster = kubernetes.cluster
     kubernetes.addons  = kubernetes
-
-    helm = helm
   }
 
   environment_name      = var.environment_name
@@ -40,5 +38,5 @@ module "retail_app_eks" {
   opentelemetry_enabled = var.opentelemetry_enabled
   tags                  = module.tags.result
 
-  istio_enabled = var.istio_enabled
+  istio_enabled = false
 }

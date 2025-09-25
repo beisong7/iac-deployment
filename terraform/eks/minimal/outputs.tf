@@ -10,7 +10,7 @@ output "cluster_endpoint" {
 
 output "cluster_arn" {
   description = "ARN of the EKS cluster"
-  value       = module.retail_app_eks.cluster_arn
+  value       = "arn:aws:eks:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:cluster/${module.retail_app_eks.eks_cluster_id}"
 }
 
 output "vpc_id" {
@@ -69,6 +69,7 @@ output "developer_kubeconfig_command" {
 
 output "developer_setup_instructions" {
   description = "Setup instructions for developer access"
+  sensitive   = true
   value = <<-EOT
 # Developer Setup Instructions for EKS Cluster Access
 
@@ -98,3 +99,4 @@ EOT
 
 # Additional AWS data
 data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}

@@ -36,8 +36,8 @@ resource "aws_iam_policy" "eks_readonly" {
           "eks:ListTagsForResource"
         ]
         Resource = [
-          module.retail_app_eks.cluster_arn,
-          "${module.retail_app_eks.cluster_arn}/*"
+          "arn:aws:eks:*:*:cluster/${module.retail_app_eks.eks_cluster_id}",
+          "arn:aws:eks:*:*:cluster/${module.retail_app_eks.eks_cluster_id}/*"
         ]
       },
       {

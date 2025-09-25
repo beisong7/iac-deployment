@@ -38,6 +38,11 @@ output "configure_kubectl" {
   value       = "aws eks --region ${data.aws_region.current.name} update-kubeconfig --name ${module.eks_cluster.cluster_name}"
 }
 
+output "cluster_arn" {
+  description = "The Amazon Resource Name (ARN) of the cluster"
+  value       = module.eks_cluster.cluster_arn
+}
+
 output "adot_namespace" {
   description = "Namespace where ADOT is deployed"
   value       = kubernetes_namespace_v1.adot.metadata[0].name
