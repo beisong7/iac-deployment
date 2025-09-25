@@ -11,7 +11,7 @@ env:
   EC2_USER: ${{ secrets.EC2_USER }}
   EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
   DEPLOYMENT_DIR: /home/ubuntu/project-bedrock
-  TERRAFORM_DIR: terraform/eks/default
+  TERRAFORM_DIR: terraform/eks/minimal
   ARCHIVE_NAME: project-bedrock.zip
 
 permissions:
@@ -24,8 +24,6 @@ jobs:
     name: 🚀 Deploy Infrastructure & Application
     timeout-minutes: 45 
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/deploy' && github.event_name == 'push'
-    environment: production
     steps:
       - name: Deploy infrastructure with Terraform
         uses: appleboy/ssh-action@v0.1.10
@@ -49,7 +47,7 @@ jobs:
             cd ${{ env.TERRAFORM_DIR }}
             terraform init
             # terraform apply -auto-approve
-            terraform apply -var="environment_name=store-retailed" -auto-approve
+            terraform apply -var="environment_name=retail-store" -auto-approve
             
             # Get outputs and save deployment info
             terraform output -json > terraform_outputs.json
@@ -92,25 +90,33 @@ jobs:
               echo "Waiting for cluster nodes to be ready..."
               kubectl wait --for=condition=Ready nodes --all --timeout=300s || echo "Some nodes may still be initializing"
               
-              # Deploy application using Helm
-              cd src/app
+              # Deploy application using in-cluster dependencies
+              echo "Deploying retail store application with in-cluster dependencies..."
               
-              if [ -d "chart" ]; then
-                echo "Deploying retail store application with Helm..."
-                helm upgrade --install retail-store ./chart \
-                  --values values.yaml \
-                  --wait --timeout=600s \
-                  --create-namespace
+              # First deploy the in-cluster dependencies manifest
+              if [ -f "k8s-manifests/retail-store-in-cluster.yaml" ]; then
+                echo "Applying in-cluster retail store deployment..."
+                kubectl apply -f k8s-manifests/retail-store-in-cluster.yaml
                 
-                echo "Application deployed successfully"
+                echo "Waiting for deployments to be ready..."
+                kubectl wait --for=condition=available --timeout=600s deployment --all -n retail-store
+                
+                echo "Application deployed successfully with in-cluster dependencies"
               else
-                echo "No Helm chart found, checking for Kubernetes manifests..."
+                echo "In-cluster manifest not found, falling back to Helm deployment..."
                 
-                # Apply any kubernetes yaml files
-                find . -name "*.yaml" -o -name "*.yml" | grep -E "(k8s|kubernetes)" | while read manifest; do
-                  echo "Applying manifest: $manifest"
-                  kubectl apply -f "$manifest"
-                done
+                # Fallback to Helm if available
+                cd src/app
+                if [ -d "chart" ]; then
+                  echo "Deploying retail store application with Helm..."
+                  helm upgrade --install retail-store ./chart \
+                    --values values.yaml \
+                    --wait --timeout=600s \
+                    --create-namespace
+                else
+                  echo "No deployment method found"
+                  exit 1
+                fi
               fi
               
               # Get application status
@@ -119,8 +125,12 @@ jobs:
               kubectl get services
               
               # Try to get load balancer URL
-              LB_URL=$(kubectl get svc ui -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Service not found or no load balancer")
+              LB_URL=$(kubectl get svc ui -n retail-store -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Service not found or no load balancer")
               echo "APP_URL=$LB_URL" >> ../terraform/deployment_info.txt
+              
+              # Also get the external IP if available
+              EXTERNAL_IP=$(kubectl get svc ui -n retail-store -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "No external IP")
+              echo "EXTERNAL_IP=$EXTERNAL_IP" >> ../terraform/deployment_info.txt
               
               echo "Application deployment completed successfully"
             else
@@ -146,20 +156,28 @@ jobs:
             export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
             
             if [ -f terraform/deployment_info.txt ]; then
-              # Check pod status
-              echo "Verifying pod status..."
-              FAILED_PODS=$(kubectl get pods -A --field-selector=status.phase!=Running --no-headers | wc -l)
+              # Check pod status in retail-store namespace
+              echo "Verifying pod status in retail-store namespace..."
+              FAILED_PODS=$(kubectl get pods -n retail-store --field-selector=status.phase!=Running --no-headers | wc -l)
               
               if [ "$FAILED_PODS" -eq 0 ]; then
-                echo "All pods are running successfully"
+                echo "All retail store pods are running successfully"
               else
                 echo "Warning: $FAILED_PODS pods are not in Running state"
-                kubectl get pods -A --field-selector=status.phase!=Running
+                kubectl get pods -n retail-store --field-selector=status.phase!=Running
               fi
+              
+              # Display all pods in retail-store namespace
+              echo "Current pod status in retail-store namespace:"
+              kubectl get pods -n retail-store
               
               # Test service connectivity
               echo "Testing service connectivity..."
-              kubectl get endpoints
+              kubectl get endpoints -n retail-store
+              
+              # Check services
+              echo "Services in retail-store namespace:"
+              kubectl get services -n retail-store
               
               echo "Post-deployment verification completed"
             else
